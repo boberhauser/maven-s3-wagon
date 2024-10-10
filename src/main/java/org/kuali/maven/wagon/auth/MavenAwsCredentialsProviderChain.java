@@ -16,55 +16,92 @@
  */
 package org.kuali.maven.wagon.auth;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
 
-import org.apache.maven.wagon.authentication.AuthenticationInfo;
+import java.util.Optional;
 
-import com.amazonaws.auth.AWSCredentialsProvider;
-import com.amazonaws.auth.AWSCredentialsProviderChain;
-import com.amazonaws.auth.EC2ContainerCredentialsProviderWrapper;
-import com.amazonaws.auth.EnvironmentVariableCredentialsProvider;
-import com.amazonaws.auth.SystemPropertiesCredentialsProvider;
-import com.amazonaws.auth.WebIdentityTokenCredentialsProvider;
-import com.amazonaws.auth.profile.ProfileCredentialsProvider;
-import com.google.common.base.Optional;
+import org.apache.maven.execution.MavenSession;
+import org.apache.maven.settings.Server;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.NodeList;
+import software.amazon.awssdk.auth.credentials.*;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathFactory;
 
 /**
  * This chain searches for AWS credentials in system properties -&gt; environment variables -&gt; ~/.m2/settings.xml
  * -&gt; AWS Configuration Profile -&gt; Amazon's EC2 Container Service/EC2 Instance Metadata Service
  */
-public final class MavenAwsCredentialsProviderChain extends AWSCredentialsProviderChain {
+public interface MavenAwsCredentialsProviderChain {
 
-	public MavenAwsCredentialsProviderChain(Optional<AuthenticationInfo> auth) {
-		super(getProviders(auth));
+	static AwsCredentialsProviderChain getProviderChain(MavenSession session, String bucketName) {
+		Logger log = LoggerFactory.getLogger(MavenAwsCredentialsProviderChain.class);
+
+		Optional<String> profileName = getAwsProfileForBucket(session, bucketName);
+		if (profileName.isPresent()) {
+			log.info("Using AWS profile: " + profileName);
+		}
+
+		AwsCredentialsProvider profileCredentialsProvider = profileName.isPresent()
+				? new AssumeRoleProfileCredentialsProvider(profileName.get())
+				: ProfileCredentialsProvider.create(); // default profile
+
+		return AwsCredentialsProviderChain.builder()
+				// System properties always win
+				.addCredentialsProvider(SystemPropertyCredentialsProvider.create())
+
+				// Then fall through to environment variables
+				.addCredentialsProvider(EnvironmentVariableCredentialsProvider.create())
+
+				// Then fall through to IAM roles for service accounts (IRSA)
+				.addCredentialsProvider(WebIdentityTokenFileCredentialsProvider.create())
+
+				// TODO .addCredentialsProvider(AuthenticationInfoCredentialsProvider)
+
+				// Then fall through to reading the ~/.aws/credentials and ~/.aws/config files many people use.
+				.addCredentialsProvider(profileCredentialsProvider)
+
+				// TODO .addCredentialsProvider(EC2ContainerCredentialsProviderWrapper)
+				.build();
 	}
 
-	private static AWSCredentialsProvider[] getProviders(Optional<AuthenticationInfo> auth) {
-		List<AWSCredentialsProvider> providers = new ArrayList<AWSCredentialsProvider>();
+	static Optional<String> getAwsProfileForBucket(MavenSession session, String bucketName) {
+		final Logger log = LoggerFactory.getLogger(MavenAwsCredentialsProviderChain.class);
+		XPath xPath = XPathFactory.newInstance().newXPath();
 
-		// System properties always win
-		providers.add(new SystemPropertiesCredentialsProvider());
+		log.info("Looking for server configuration of bucket: " + bucketName);
 
-		// Then fall through to environment variables
-		providers.add(new EnvironmentVariableCredentialsProvider());
+		for (Server server : session.getSettings().getServers()) {
+			if (server.getConfiguration() != null) {
+				try {
+					DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+					Document doc = builder.parse(
+							new ByteArrayInputStream(server.getConfiguration().toString().getBytes(StandardCharsets.UTF_8)));
 
-		// Then fall through to IAM roles for service accounts (IRSA)
-		providers.add(WebIdentityTokenCredentialsProvider.create());
+					NodeList nodeList = (NodeList) xPath.evaluate("//bucket.name", doc, XPathConstants.NODESET);
+					if (nodeList != null && nodeList.getLength() > 0) {
+						if (bucketName.equalsIgnoreCase(nodeList.item(0).getTextContent())) {
+							NodeList awsProfiles = (NodeList) xPath.evaluate("//aws.profile", doc, XPathConstants.NODESET);
+							if (awsProfiles != null && awsProfiles.getLength() > 0) {
+								return Optional.of(awsProfiles.item(0).getTextContent());
+							}
+						}
+					}
+				}
+				catch (Exception e) {
+					log.error("Unable to parse XML: " + e.getMessage());
+				}
+			}
+		}
 
-		// Then fall through to settings.xml
-		providers.add(new AuthenticationInfoCredentialsProvider(auth));
-
-		// Then fall thru to reading the ~/.aws/credentials files many people use.
-		providers.add(new ProfileCredentialsProvider());
-
-		// Then fall through to either Amazon's Amazon EC2 Container Service or EC2 Instance Metadata Service
-		// http://docs.aws.amazon.com/AWSSdkDocsJava/latest/DeveloperGuide/java-dg-roles.html
-		// This allows you setup an IAM role, attach that role to an EC2 Instance at launch time,
-		// and thus automatically provide the wagon with the credentials it needs
-		providers.add(new EC2ContainerCredentialsProviderWrapper());
-
-		return providers.toArray(new AWSCredentialsProvider[providers.size()]);
+		return Optional.empty();
 	}
-
 }
