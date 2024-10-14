@@ -69,6 +69,10 @@ public interface MavenAwsCredentialsProviderChain {
 				// Then fall through to reading the ~/.aws/credentials and ~/.aws/config files many people use.
 				.addCredentialsProvider(profileCredentialsProvider)
 
+				// Then fall through to ECS Container and EC2 Instance providers
+				.addCredentialsProvider(ContainerCredentialsProvider.create())
+				.addCredentialsProvider(InstanceProfileCredentialsProvider.create())
+
 				// TODO .addCredentialsProvider(EC2ContainerCredentialsProviderWrapper)
 				.build();
 	}
